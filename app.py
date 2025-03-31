@@ -265,14 +265,14 @@ def main():
     # Query input
     st.subheader("Query Parameters")
     default_query = """Extract the following design parameters from the documents: 
-        - Post Code of Project Location: (Mostly found in the title block of the drawing attached to emails), 
-        - Drawing Reference: (Either 'Amendment' or 'New Enquiry' depending on the context of the email), 
-        - Drawing Title, 
-        - Revision, 
+        - Post Code of Project Location: (Mostly found in the title block of the drawing attached to emails. If post code of drawing architect exists, ignore it and use the post code of the project location), 
+        - Drawing Reference: (TaperedPlus Reference Number e.g. TP12345_00.01 - A), 
+        - Drawing Title (The Project Name), 
+        - Revision (Suffix of the drawing reference e.g. 00.01 - A), 
         - Date Received: (Date initial email was sent by customer), 
-        - Company: (Client company requesting technical drawings or services),
-        - Contact: (Contact Person of the client company), 
-        - Reason for Change: (if applicable), 
+        - Company: (Client company requesting technical drawings or TaperedPlus services, usually the email sender requesting the drawings from TaperedPlus),
+        - Contact: (Contact Person, usually the email sender requesting the drawings from TaperedPlus), 
+        - Reason for Change: (Either 'Amendment' or 'New Enquiry' depending on the context of the email), 
         - Surveyor: (Name of the surveyor if provided), 
         - Target U-Value, 
         - Target Min U-Value, 
