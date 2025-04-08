@@ -98,8 +98,8 @@ def process_pdf_with_gemini(pdf_content, filename):
             pdf_data = f.read()
             
             response = client.models.generate_content(
-                # model="gemini-2.0-flash",
-                model="gemini-2.5-pro-exp-03-25",
+                model="gemini-2.0-flash",
+                # model="gemini-2.5-pro-exp-03-25",
                 contents=[
                     types.Part.from_bytes(
                         data=pdf_data,
@@ -146,8 +146,8 @@ def process_multiple_pdfs(pdf_files):
                 pdf_data = f.read()
                 
                 response = client.models.generate_content(
-                    # model="gemini-2.0-flash",
-                    model="gemini-2.5-pro-exp-03-25",
+                    model="gemini-2.0-flash",
+                    # model="gemini-2.5-pro-exp-03-25",
                     contents=[
                         types.Part.from_bytes(
                             data=pdf_data,
@@ -215,8 +215,8 @@ def query_llm(all_text, query):
     # Get response from Gemini using the client approach
     with st.spinner("Analyzing Results..."):
         response = client.models.generate_content(
-            # model="gemini-2.0-flash",
-            model="gemini-2.5-pro-exp-03-25",
+            model="gemini-2.0-flash",
+            # model="gemini-2.5-pro-exp-03-25",
             contents=prompt,
             #generation_config={"temperature": 0}
         )
