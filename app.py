@@ -708,7 +708,8 @@ def main():
         - Tapered Insulation: (The type or brand of tapered insulation product requested).
         - Decking: (The type of roof decking material described)."""
     
-    query = st.text_area("Enter your query for the AI analysis:", value=default_query, height=200)
+    # query = st.text_area("Enter your query for the AI analysis:", value=default_query, height=200)
+    query = default_query
     
     # Process button
     process_button = st.button("Process Files")
@@ -950,15 +951,23 @@ def main():
                                 value = map_tapered_insulation_value(value)
                                 print(f"DEBUG: Extracted Tapered Insulation value: {value}")
                             # For Post Code, extract just the postcode area (initial letters)
-                            elif param == "Post Code" and value and value != "Not found" and value != "Not provided":
-                                # Define UK postcode pattern
-                                uk_postcode_pattern = r'([A-Z]{1,2})[0-9]'
-                                postcode_match = re.search(uk_postcode_pattern, value.upper())
-                                if postcode_match:
-                                    value = postcode_match.group(1)
-                                    print(f"DEBUG: Extracted postcode area '{value}' from '{value}'")
+                            elif param == "Post Code":
+                                # First clean up any formatting from the LLM response
+                                cleaned_value = re.sub(r'^\s*of Project Location:?\*?\s*', '', value, flags=re.IGNORECASE)
+                                cleaned_value = cleaned_value.strip()
+                                
+                                # Check if the value indicates "not provided" or similar
+                                if re.search(r'not\s+provided|not\s+found|none', cleaned_value, re.IGNORECASE):
+                                    value = "Not provided"
                                 else:
-                                    print(f"DEBUG: Could not find valid UK postcode format in '{value}'")
+                                    # Define UK postcode pattern
+                                    uk_postcode_pattern = r'([A-Z]{1,2})[0-9]'
+                                    postcode_match = re.search(uk_postcode_pattern, cleaned_value.upper())
+                                    if postcode_match:
+                                        value = postcode_match.group(1)
+                                    else:
+                                        # Keep original value if it doesn't match a postcode pattern
+                                        value = cleaned_value
                             
                             result_dict[param] = value
                         else:
