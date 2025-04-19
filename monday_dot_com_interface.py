@@ -23,6 +23,7 @@ class MondayDotComInterface:
         
         return True, ""
 
+
     def send_query_to_monday(self, query: str) -> Dict[str, Any]:
         """
         Sends a GraphQL query to the Monday.com API.
@@ -314,68 +315,118 @@ class MondayDotComInterface:
         else:
             return items[0], "Multiple items found in Monday.com. Using the first match."
 
-    def get_tapered_enquiry_projects(self) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+    @staticmethod
+    def _build_items_page_query(board_id: str,
+                                start_date: str,
+                                cursor: Optional[str] = None) -> str:
         """
-        Gets a list of all projects from the Tapered Enquiry Maintenance board,
-        including the project title from the "Project Name" column.
-        
-        Returns a tuple of (projects_list, error_message)
+        Helper – returns the exact JSON string you must POST to Monday.com.
+        If `cursor` is provided we're building a pagination request, otherwise
+        it is the first page.
         """
-        active_boards_root = self.send_query_to_monday(
-            '{"query":"query Boards{boards(state: active, limit: 100000){name id}}"}'
-        )
-        
-        if active_boards_root is not None:
-            # Find the Tapered Enquiry Maintenance board
-            enquiry_boards = [b for b in active_boards_root["data"]["boards"] if b["name"] == "Tapered Enquiry Maintenance"]
-            
-            if not enquiry_boards:
-                return None, "Tapered Enquiry Maintenance board not found in Monday.com"
-            
-            items = []
-            
-            for board in enquiry_boards:
-                # Modify the query to include the "Project Name" column's text
-                query = (
-                    '{"query":"query next_items_page {boards(ids: ' + board["id"] +
-                    ', limit: 100000) {id name items_page(limit: 500, cursor: null) {cursor items {id name state column_values(ids: [\\\"text3__1\\\"]) {text}}} items_count}}"}'
-                )
-                found_items = self.send_query_to_monday(query)
-                
-                if found_items["data"] is None:
-                    return None, "Items not found in Monday.com"
-                
-                if (found_items["data"]["boards"] is not None and 
-                    found_items["data"]["boards"][0]["items_page"] is not None):
-                    if found_items["data"]["boards"][0]["items_page"]["items"] is not None:
-                        # Only keep active projects
-                        active_items = [item for item in found_items["data"]["boards"][0]["items_page"]["items"] 
-                                        if item["state"] == "active"]
-                        items.extend(active_items)
-                    
-                    # Handle pagination if more than one page exists
-                    cursor = found_items["data"]["boards"][0]["items_page"]["cursor"]
-                    while cursor is not None:
-                        next_query = (
-                            '{"query":"query next_items_page {boards(ids: ' + board["id"] +
-                            ', limit: 100000) {id name items_page(limit: 500, cursor: \\\"' + cursor +
-                            '\\\") {cursor items {id name state column_values(ids: [\\\"text3__1\\\"]) {text}}} items_count}}"}'
-                        )
-                        found_items = self.send_query_to_monday(next_query)
-                        if found_items["data"]["boards"][0]["items_page"]["items"] is not None:
-                            active_items = [item for item in found_items["data"]["boards"][0]["items_page"]["items"] 
-                                            if item["state"] == "active"]
-                            items.extend(active_items)
-                        cursor = found_items["data"]["boards"][0]["items_page"]["cursor"]
-            
-            if not items:
-                return None, "No projects found in Tapered Enquiry Maintenance board"
-            else:
-                return items, ""
-        else:
-            return None, "Unable to retrieve Boards from Monday.com"
+        # ------- GraphQL block (clean, human‑readable) -------------------------
+        gql = f"""
+        query {{
+        boards(ids: {board_id}) {{
+            items_page(
+            limit: 500,
+            {f'cursor: "{cursor}",' if cursor else ''}
+            query_params: {{
+                rules: [{{
+                column_id: "date9__1",
+                compare_value: ["EXACT", "{start_date}"],
+                operator: greater_than_or_equals
+                }}]
+            }}
+            ) {{
+            cursor
+            items {{
+                id
+                name
+                state
+                column_values(ids: ["text3__1", "date9__1"]) {{
+                id
+                text
+                __typename
+                ... on MirrorValue {{
+                    display_value
+                }}
+                }}
+            }}
+            }}
+        }}
+        }}
+        """
+        # The Monday endpoint expects a JSON payload *whose single member*
+        # is the GraphQL string.
+        return json.dumps({"query": gql})
+    
 
-    def get_project_by_title(self, board_id: str, project_title: str, limit: int = 20) -> Tuple[Optional[Dict[str, Any]], str]:
+    def get_tapered_enquiry_projects(
+            self,
+            start_date: str = "2021-01-01"
+    ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+        """
+        Return active projects whose **Created** date (column `date9__1`)
+        is **on or after** `start_date` (YYYY‑MM‑DD) from the
+        "Tapered Enquiry Maintenance" board.
+        """
+        board_id = "1825117125"
+        items: List[Dict[str, Any]] = []
+
+        # ---- first page -------------------------------------------------------
+        payload = self._build_items_page_query(board_id, start_date)
+        response = self.send_query_to_monday(payload)
+
+        if response is None:
+            return None, "No response from Monday.com"
+
+        if "errors" in response:
+            return None, f"Monday.com API error: {response['errors']}"
+
+        try:
+            page = response["data"]["boards"][0]["items_page"]
+        except (KeyError, IndexError, TypeError):
+            return None, "Unexpected payload structure from Monday.com"
+
+        # ---- collect items & paginate ----------------------------------------
+        def _append_active(page_obj: Dict[str, Any]) -> None:
+            for itm in page_obj.get("items", []):
+                if itm.get("state") == "active":
+                    items.append(itm)
+
+        _append_active(page)
+        cursor = page.get("cursor")
+
+        while cursor:
+            payload = self._build_items_page_query(board_id, start_date, cursor)
+            response = self.send_query_to_monday(payload)
+
+            # More thorough error checking for nested values
+            if response is None or "data" not in response:
+                break
+            
+            # Check if boards exists and is not empty
+            if not response["data"].get("boards"):
+                break
+                
+            # Access the first board safely
+            board = response["data"]["boards"][0] if response["data"]["boards"] else None
+            if not board or "items_page" not in board:
+                break
+                
+            page = board["items_page"]
+            _append_active(page)
+            cursor = page.get("cursor")
+
+        if not items:
+            return None, (
+                f"No active projects created on or after {start_date} "
+                "were found on the Tapered Enquiry Maintenance board."
+            )
+        return items, ""
+
+    def get_project_by_title(self, board_id: str, project_title: str, limit: int = 10) -> Tuple[Optional[Dict[str, Any]], str]:
         """
         Gets a project by its title (from the "Project Name" column) on a specific board.
         
@@ -462,8 +513,6 @@ class MondayDotComInterface:
         else:
             return None, f"Project with title '{project_title}' not found"
         
-
-
     def check_project_exists(self, sample_project_name: str, similarity_threshold: float = 0.55) -> Dict[str, Any]:
         """
         Checks if a project name exists or is similar to any project in the Tapered Enquiry Maintenance board.

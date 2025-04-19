@@ -5,6 +5,11 @@ from email.parser import BytesParser
 import tempfile
 import io
 import extract_msg  # Added for .msg file processing
+import time
+import random
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
+from PIL import Image
+import re
 
 import pandas as pd
 import streamlit as st
@@ -25,6 +30,48 @@ load_dotenv()
 # Initialize the client
 client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
 
+# Define a function to check if an exception is a rate limit error
+def is_rate_limit_error(exception):
+    return '429' in str(exception) or 'RESOURCE_EXHAUSTED' in str(exception)
+
+# Create a retry decorator for Gemini API calls
+@retry(
+    retry=retry_if_exception_type(),
+    wait=wait_exponential(multiplier=1, min=2, max=60),
+    stop=stop_after_attempt(5)
+)
+def gemini_api_with_retry(model, contents):
+    """
+    Call Gemini API with retry logic for rate limiting
+    
+    Args:
+        model: The Gemini model to use
+        contents: The contents to send to the model
+        
+    Returns:
+        The model response
+    """
+    try:
+        # Add a small random delay to help with rate limiting
+        time.sleep(random.uniform(0.5, 1.5))
+        
+        # Make the API call
+        response = client.models.generate_content(
+            model=model,
+            contents=contents
+        )
+        return response
+    except Exception as e:
+        # Check if this is a rate limiting error
+        if is_rate_limit_error(e):
+            st.warning(f"Rate limit hit. Waiting before retrying... ({str(e)})")
+            # Re-raise to trigger retry
+            raise e
+        else:
+            # For other errors, log and re-raise without retry
+            st.error(f"Error calling Gemini API: {str(e)}")
+            raise e
+
 # Add reset function
 def reset_app_state():
     """Clear all session state variables to reset the app"""
@@ -36,18 +83,19 @@ def process_eml_file(eml_file_path):
     """
     Processes a single .eml file:
       - Parses the email to extract header and body.
-      - Extracts attachments and returns their data.
+      - Extracts attachments and inline images and returns their data.
     
     Returns:
       header: string with key header fields.
       body: string containing the plain text body.
       attachments_data: list of dictionaries with attachment data.
+      inline_images: list of dictionaries with inline image data.
     """
     # Open and parse the email file using the default email policy
     with open(eml_file_path, 'rb') as f:
         msg = BytesParser(policy=policy.default).parse(f)
 
-    # Extract some header fields
+    # Extract header fields
     header_info = (
         f"From: {msg.get('from', '')}\n"
         f"To: {msg.get('to', '')}\n"
@@ -64,26 +112,40 @@ def process_eml_file(eml_file_path):
     else:
         body = msg.get_content()
     
-    # Process attachments
+    # Process attachments and inline images
     attachments_data = []
+    inline_images = []
+    
     for part in msg.iter_attachments():
         filename = part.get_filename()
         if filename:
-            attachment_data = {
-                'filename': filename,
-                'content': part.get_payload(decode=True)
-            }
-            attachments_data.append(attachment_data)
+            # Check if this is an inline image
+            is_inline = False
+            content_id = part.get('Content-ID')
+            
+            # Images with Content-ID are typically inline
+            if content_id and filename.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
+                is_inline = True
+                
+            if is_inline:
+                inline_image_data = {
+                    'filename': filename,
+                    'content': part.get_payload(decode=True),
+                    'content_id': content_id,
+                    'mime_type': part.get_content_type()
+                }
+                inline_images.append(inline_image_data)
+            else:
+                attachment_data = {
+                    'filename': filename,
+                    'content': part.get_payload(decode=True)
+                }
+                attachments_data.append(attachment_data)
     
-    return header_info, body, attachments_data
+    return header_info, body, attachments_data, inline_images
 
 def process_pdf_with_gemini(pdf_content, filename):
-    """
-    Process PDF content using Gemini's File API
-    
-    Returns:
-        text: Extracted text and information from the PDF
-    """
+    """Process PDF content using Gemini's File API"""
     try:
         # Create a temporary file to use with Gemini
         with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
@@ -97,9 +159,10 @@ def process_pdf_with_gemini(pdf_content, filename):
         with open(temp_file_path, 'rb') as f:
             pdf_data = f.read()
             
-            response = client.models.generate_content(
-                model="gemini-2.0-flash",
-                # model="gemini-2.5-pro-exp-03-25",
+            # Use retry function instead of direct API call
+            response = gemini_api_with_retry(
+               # model="gemini-2.0-flash",
+                model="gemini-2.5-flash-preview-04-17",
                 contents=[
                     types.Part.from_bytes(
                         data=pdf_data,
@@ -110,7 +173,6 @@ def process_pdf_with_gemini(pdf_content, filename):
             )
             
         return response.text
-    
     except Exception as e:
         st.error(f"Error processing PDF with Gemini: {e}")
         return f"Error processing PDF: {str(e)}"
@@ -145,9 +207,9 @@ def process_multiple_pdfs(pdf_files):
             with open(temp_file_path, 'rb') as f:
                 pdf_data = f.read()
                 
-                response = client.models.generate_content(
-                    model="gemini-2.0-flash",
-                    # model="gemini-2.5-pro-exp-03-25",
+                response = gemini_api_with_retry(
+                    # model="gemini-2.0-flash",
+                    model="gemini-2.5-flash-preview-04-17",
                     contents=[
                         types.Part.from_bytes(
                             data=pdf_data,
@@ -170,34 +232,179 @@ def process_multiple_pdfs(pdf_files):
     
     return combined_text
 
-def extract_text_from_email(email_text, attachments_data):
+def process_multiple_images(image_files, image_type="ATTACHMENT"):
     """
-    Extracts all text from email and attachments and returns as a single string.
-    Uses Gemini for PDF processing.
-    """
-    combined_text = f"EMAIL CONTENT:\n{email_text}\n\n"
+    Process multiple image files with Gemini
     
-    # Collect PDF attachments
-    pdf_attachments = []
-    for attachment in attachments_data:
-        filename = attachment['filename']
-        content = attachment['content']
+    Args:
+        image_files: List of image file data (content and filename)
+        image_type: Type of image (ATTACHMENT or INLINE IMAGE)
         
-        if filename.lower().endswith(".pdf"):
-            pdf_attachments.append({
-                'filename': filename,
-                'content': content
-            })
-        else:
-            # For non-PDF attachments, just note they exist but weren't processed
-            combined_text += f"\nATTACHMENT ({filename}) [Not processed - not a PDF]\n\n"
+    Returns:
+        combined_text: Combined text from image analysis
+    """
+    combined_text = ""
     
-    # Process PDF attachments with Gemini
-    if pdf_attachments:
-        pdf_text = process_multiple_pdfs(pdf_attachments)
-        combined_text += pdf_text
+    for image_file in image_files:
+        filename = image_file['filename']
+        content = image_file['content']
+        file_extension = filename.split(".")[-1].lower()
+        
+        # Create a temporary file
+        with tempfile.NamedTemporaryFile(suffix=f'.{file_extension}', delete=False) as temp_file:
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        try:
+            # Process the image with Gemini using the client approach
+            with open(temp_file_path, 'rb') as f:
+                image_data = f.read()
+                
+                response = gemini_api_with_retry(
+                    # model="gemini-2.0-flash",
+                    model="gemini-2.5-flash-preview-04-17",
+                    contents=[
+                        types.Part.from_bytes(
+                            data=image_data,
+                            mime_type=f'image/{file_extension}',
+                        ),
+                        "Describe this image in detail, including any visible text, diagrams, or drawings. Extract any technical parameters or specifications you can see."
+                    ]
+                )
+                
+            combined_text += f"\n{image_type} ({filename}):\n{response.text}\n\n"
+        
+        except Exception as e:
+            st.error(f"Error processing image {filename} with Gemini: {e}")
+            combined_text += f"\n{image_type} ({filename}) [Error: {str(e)}]\n\n"
+        
+        finally:
+            # Clean up the temporary file
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
     
     return combined_text
+
+def extract_text_from_email(email_text, attachments_data, inline_images=None):
+    """Extracts all text from email and attachments returns as a single string."""
+    combined_text = f"EMAIL CONTENT:\n{email_text}\n\n"
+    
+    # For non-visual content attachments, just note they exist
+    for attachment in attachments_data:
+        filename = attachment['filename']
+        if not (filename.lower().endswith(".pdf") or 
+                filename.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp'))):
+            combined_text += f"\nATTACHMENT ({filename}) [Not processed - not a PDF or image]\n\n"
+    
+    # Limit the total number of visual items to process to avoid rate limits
+    MAX_VISUAL_ITEMS = 10
+    
+    # Collect all visual attachments
+    pdf_attachments = [a for a in attachments_data if a['filename'].lower().endswith(".pdf")]
+    image_attachments = [a for a in attachments_data if a['filename'].lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp'))]
+    
+    all_visual_items = []
+    
+    # Add most important items first
+    if pdf_attachments:
+        all_visual_items.extend([('pdf', pdf) for pdf in pdf_attachments])
+    if image_attachments:
+        all_visual_items.extend([('image', img) for img in image_attachments])
+    if inline_images:
+        all_visual_items.extend([('inline', img) for img in inline_images])
+    
+    # Process only a limited number of items
+    processed_items = all_visual_items[:MAX_VISUAL_ITEMS]
+    skipped_items = all_visual_items[MAX_VISUAL_ITEMS:]
+    
+    # Note skipped items
+    if skipped_items:
+        combined_text += "\nNOTE: Some visual elements were not processed due to API rate limits:\n"
+        for item_type, item in skipped_items:
+            combined_text += f"- {item_type.upper()}: {item['filename']}\n"
+        combined_text += "\n"
+    
+    # Process the limited set of items
+    for item_type, item in processed_items:
+        if item_type == 'pdf':
+            # Process this PDF
+            with st.spinner(f"Processing PDF: {item['filename']}..."):
+                pdf_text = process_pdf_with_gemini(item['content'], item['filename'])
+                combined_text += f"\nPDF ATTACHMENT ({item['filename']}):\n{pdf_text}\n\n"
+        elif item_type == 'inline':
+            # Process this inline image
+            with st.spinner(f"Processing inline image: {item['filename']}..."):
+                image_text = process_image_with_gemini(item['content'], item['filename'], "INLINE IMAGE")
+                combined_text += f"\nINLINE IMAGE ({item['filename']}):\n{image_text}\n\n"
+        elif item_type == 'image':
+            # Process this image attachment
+            with st.spinner(f"Processing image: {item['filename']}..."):
+                image_text = process_image_with_gemini(item['content'], item['filename'], "ATTACHMENT")
+                combined_text += f"\nIMAGE ATTACHMENT ({item['filename']}):\n{image_text}\n\n"
+    
+    return combined_text
+
+# Helper function to process a single image
+def process_image_with_gemini(image_content, filename, image_type="ATTACHMENT"):
+    """Process a single image with Gemini"""
+    # Define supported image formats and their MIME types
+    SUPPORTED_FORMATS = {
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'png': 'image/png',
+        'webp': 'image/webp'
+    }
+    
+    file_extension = filename.split(".")[-1].lower()
+    
+    # Validate file format
+    if file_extension not in SUPPORTED_FORMATS:
+        return f"Unsupported image format: {file_extension}. Only {', '.join(SUPPORTED_FORMATS.keys())} are supported."
+    
+    # Get proper MIME type
+    mime_type = SUPPORTED_FORMATS[file_extension]
+    
+    # Create a temporary file
+    with tempfile.NamedTemporaryFile(suffix=f'.{file_extension}', delete=False) as temp_file:
+        temp_file.write(image_content)
+        temp_file_path = temp_file.name
+    
+    try:
+        # Process the image with Gemini using the client approach
+        with open(temp_file_path, 'rb') as f:
+            image_data = f.read()
+            
+            # Use a try/except block specifically for this API call
+            try:
+                response = gemini_api_with_retry(
+                    # model="gemini-2.0-flash",
+                    model="gemini-2.5-flash-preview-04-17",
+                    contents=[
+                        types.Part.from_bytes(
+                            data=image_data,
+                            mime_type=mime_type,
+                        ),
+                        "Describe this image in detail, including any visible text, diagrams, or drawings. Extract any technical parameters or specifications you can see."
+                    ]
+                )
+                
+                return response.text
+            except Exception as e:
+                error_message = str(e)
+                # Check if it's specifically a format issue
+                if "INVALID_ARGUMENT" in error_message:
+                    return f"Unable to process this image due to format compatibility issues. Please note any visible information from the image might not be included in the analysis."
+                else:
+                    raise e  # Re-raise the exception for other types of errors
+    
+    except Exception as e:
+        # Use logging instead of st.error
+        print(f"Error processing image {filename} with Gemini: {e}")
+        return f"Error processing image: {str(e)}"
+    finally:
+        # Clean up the temporary file
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
 
 def query_llm(all_text, query):
     """
@@ -205,20 +412,21 @@ def query_llm(all_text, query):
     """
     # Construct a prompt that includes both the context and the query
     prompt = f"""
-    Please analyze the following information extracted from emails and PDF documents:
+    Please analyze the following information extracted from emails, PDF documents, and images:
     
     {all_text}
     
     QUESTION: {query}
+    
+    Note that information may be found in any of the content sources, including text from image descriptions.
     """
     
     # Get response from Gemini using the client approach
     with st.spinner("Analyzing Results..."):
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            # model="gemini-2.5-pro-exp-03-25",
-            contents=prompt,
-            #generation_config={"temperature": 0}
+        response = gemini_api_with_retry(
+            # model="gemini-2.0-flash",
+            model="gemini-2.5-flash-preview-04-17",
+            contents=prompt
         )
     
     return response.text
@@ -227,12 +435,13 @@ def process_msg_file(msg_file_path):
     """
     Processes a single .msg file (Outlook email format):
       - Parses the email to extract header and body.
-      - Extracts attachments and returns their data.
+      - Extracts attachments and inline images and returns their data.
     
     Returns:
       header: string with key header fields.
       body: string containing the plain text body.
       attachments_data: list of dictionaries with attachment data.
+      inline_images: list of dictionaries with inline image data.
     """
     # Open and parse the Outlook message file
     msg = extract_msg.Message(msg_file_path)
@@ -249,18 +458,43 @@ def process_msg_file(msg_file_path):
         # Extract the email body
         body = msg.body
         
-        # Process attachments
+        # Process attachments and inline images
         attachments_data = []
+        inline_images = []
+        
         for attachment in msg.attachments:
             filename = attachment.longFilename or attachment.shortFilename
             if filename:
-                attachment_data = {
-                    'filename': filename,
-                    'content': attachment.data
-                }
-                attachments_data.append(attachment_data)
+                # Try to determine if it's an inline image
+                is_inline = False
+                
+                # Look for typical image extensions and check if it might be inline
+                # Outlook msg format doesn't clearly distinguish inline vs attachment 
+                # so we'll use heuristics
+                if filename.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
+                    # Check if there's a content ID or if it's referenced in HTML
+                    # This is a heuristic approach
+                    if hasattr(attachment, 'cid') and attachment.cid:
+                        is_inline = True
+                    elif hasattr(msg, 'htmlBody') and msg.htmlBody and filename in msg.htmlBody.decode('utf-8', errors='ignore'):
+                        is_inline = True
+                        
+                if is_inline:
+                    inline_image_data = {
+                        'filename': filename,
+                        'content': attachment.data,
+                        'content_id': attachment.cid if hasattr(attachment, 'cid') else None,
+                        'mime_type': f"image/{filename.split('.')[-1].lower()}"
+                    }
+                    inline_images.append(inline_image_data)
+                else:
+                    attachment_data = {
+                        'filename': filename,
+                        'content': attachment.data
+                    }
+                    attachments_data.append(attachment_data)
         
-        return header_info, body, attachments_data
+        return header_info, body, attachments_data, inline_images
     
     finally:
         # Close the msg file to release the file handle
@@ -273,8 +507,12 @@ def extract_project_name_from_content(email_text, attachments_data):
     Returns:
         str: The extracted project name
     """
-    # Extract text from email and attachments
-    combined_text = extract_text_from_email(email_text, attachments_data)
+    # Use already extracted text if available (to avoid reprocessing)
+    if hasattr(st.session_state, 'all_extracted_text') and st.session_state.all_extracted_text:
+        combined_text = st.session_state.all_extracted_text
+    else:
+        # Fallback to extracting text if not already done
+        combined_text = extract_text_from_email(email_text, attachments_data)
     
     # Create a focused prompt for the LLM
     prompt = f"""
@@ -285,9 +523,9 @@ def extract_project_name_from_content(email_text, attachments_data):
     """
     
     # Send to Gemini for analysis
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        # model="gemini-2.5-pro-exp-03-25",
+    response = gemini_api_with_retry(
+        # model="gemini-2.0-flash",
+        model="gemini-2.5-flash-preview-04-17",
         contents=prompt
     )
     
@@ -347,14 +585,10 @@ def extract_parameters_from_monday_project(project_details):
         
         print(f"DEBUG: Using latest subitem: {latest_subitem['name']}")
         
-        # Extract Drawing Reference and Revision from subitem name (e.g., "16763_25.01 - A")
-        if '_' in latest_subitem['name'] and ' - ' in latest_subitem['name']:
-            parts = latest_subitem['name'].split('_')
-            if len(parts) >= 2:
-                ref_parts = parts[1].split(' - ')
-                if len(ref_parts) >= 2:
-                    params["Drawing Reference"] = f"{parts[0]}_{ref_parts[0]}"
-                    params["Revision"] = ref_parts[1]
+        # Extract Drawing Reference from subitem name
+        if '_' in latest_subitem['name']:
+            # The entire name (e.g., "16903_25.01 - A") should be used as Drawing Reference
+            params["Drawing Reference"] = latest_subitem['name']  # Use the full name
         
         # Map column IDs to parameter names for subitem values
         column_mappings = {
@@ -370,6 +604,7 @@ def extract_parameters_from_monday_project(project_details):
             "mirror75__1": "Decking",            # Deck Type column
             "mirror95__1": "Date Received",      # Date Received column
             "mirror03__1": "Reason for Change",  # Reason For Change column
+            "mirror_1__1": "Revision",           # Revision column
         }
         
         # Process each column value in the subitem
@@ -394,26 +629,30 @@ def extract_parameters_from_monday_project(project_details):
     
     return params
 
-def get_monday_column_mappings():
-    """
-    Returns a mapping of Monday.com column IDs to parameter names.
-    This allows for easy customization of the column mappings.
-    """
-    return {
-        "text3__1": "Drawing Title",      # Project Name column
-        "text": "Post Code",              # Postcode column
-        "text7": "Drawing Reference",     # Drawing Reference column
-        "text79": "Revision",             # Revision column
-        "date4": "Date Received",         # Date Received column
-        "text2": "Company",               # Company column
-        "text94": "Contact",              # Contact column
-        "text5": "Surveyor",              # Surveyor column
-        "text9": "Target U-Value",        # Target U-Value column
-        "text6": "Target Min U-Value",    # Min U-Value column
-        "text8": "Fall of Tapered",       # Fall of Tapered column
-        "text4": "Tapered Insulation",    # Tapered Insulation column
-        "text0": "Decking"                # Decking column
+def map_tapered_insulation_value(value):
+    """Maps specific insulation product values to their category headers"""
+    
+    # Define lookup tables based on the image data
+    insulation_mappings = {
+        "TissueFaced PIR": ["TT47", "TR27", "Glass Tissue PIR", "Powerdeck F", "Adhered", "MG", "TR/MG", "FR/MG", "BauderPIR FA-TE", "Evatherm A", "Hytherm ADH"],
+        "TorchOn PIR": ["TT44", "TR24", "Torched", "Powerdeck U", "Torched", "BGM", "TR/BGM", "FR/BGM", "BauderPIR FA"],
+        "FoilFaced PIR": ["TT46", "TR26", "Foil", "Powerdeck Eurodeck", "Mech Fixed", "ALU", "TR/ALU", "FR/ALU", "Aluminium Faced"],
+        "ROCKWOOL HardRock MultiFix DD": ["Mineral wool", "Hardrock", "stonewool", "stone wool", "rock wool", "bauderrock"],
+        "Foamglas T3+": ["Cellular Glass", "foamed glass", "Bauderglas"],
+        "EPS": ["Expanded Polystrene"],
+        "XPS": ["Extruded Polystyrene"]
     }
+    
+    # Check if value exactly matches or contains any of the lookup values
+    if value and value != "Not found":
+        original_value = value
+        for category, products in insulation_mappings.items():
+            for product in products:
+                if product.lower() in value.lower() or value.lower() in product.lower():
+                    return category
+    
+    # Return original value if no match found
+    return value
 
 # Streamlit app
 def main():
@@ -452,21 +691,22 @@ def main():
     
     # Query input
     st.subheader("Query Parameters")
-    default_query = """Extract the following design parameters from the documents: 
-        - Post Code of Project Location: (Mostly found in the title block of the drawing attached to emails. If post code of drawing architect exists, ignore it and use the post code of the project location), 
-        - Drawing Reference: (TaperedPlus Reference Number e.g. TP12345_00.01 - A), 
-        - Drawing Title (The Project Name, usually the project location), 
-        - Revision (Suffix of the drawing reference e.g. 00.01 - A), 
-        - Date Received: (Date initial email was sent by customer), 
-        - Company: (Client company requesting technical drawings or TaperedPlus services, usually the email sender requesting the drawings from TaperedPlus),
-        - Contact: (Contact Person, usually the email sender requesting the drawings from TaperedPlus), 
-        - Reason for Change: (Either 'Amendment' or 'New Enquiry' depending on the context of the email), 
-        - Surveyor: (Name of the surveyor if provided), 
-        - Target U-Value, 
-        - Target Min U-Value, 
-        - Fall of Tapered,
-        - Tapered Insulation, 
-        - Decking."""
+    # Optimized prompt to handle forwarded emails and identify the direct requester
+    default_query = """Extract the following design parameters from the documents for a TaperedPlus technical drawing request: 
+        - Post Code of Project Location: (Mostly found in the title block of the drawing attached to emails. Ignore the postcode of any company office address or sender/recipient address and use the post code of the project location only, otherwise state 'Not provided').
+        - Drawing Reference: (TaperedPlus Reference Number e.g. TP*****_**.** - *. Look for references associated with TaperedPlus specifically. If multiple exist, prioritize the latest one mentioned in the context of the request *to* TaperedPlus).
+        - Drawing Title (The Project Name, usually the project location).
+        - Revision (Suffix of the drawing reference e.g. **.** - A. If multiple exist, use the one associated with the Drawing Reference identified above).
+        - Date Received: (Date the email requesting the service *from TaperedPlus* was sent. In a forwarded email chain, this is the date the email was sent *to TaperedPlus*, not the date of the original email further down the chain).
+        - Company: (Identify the company *directly requesting* technical drawings or services *from TaperedPlus*. In a forwarded email, this is the company of the person *sending the email to TaperedPlus*, NOT the company of the original sender further down the chain. Look for the company directly communicating with TaperedPlus).
+        - Contact: (Identify the contact person *directly requesting* the job or drawings *from TaperedPlus*. In a forwarded email, this is the person *sending the email to TaperedPlus*, NOT the original sender further down the chain. Look for the individual directly communicating with TaperedPlus).
+        - Reason for Change: (Either 'Amendment' or 'New Enquiry' based on whether the request refers to an existing project or is entirely new).
+        - Surveyor: (Name of the surveyor if provided).
+        - Target U-Value: (The primary target U-Value requested for the main insulation area).
+        - Target Min U-Value: (A secondary or minimum target U-Value if specified, often for specific areas like upstands).
+        - Fall of Tapered: (The required fall or slope for the tapered insulation).
+        - Tapered Insulation: (The type or brand of tapered insulation product requested).
+        - Decking: (The type of roof decking material described)."""
     
     query = st.text_area("Enter your query for the AI analysis:", value=default_query, height=200)
     
@@ -481,39 +721,56 @@ def main():
     if process_button and uploaded_files and not st.session_state.processed_files:
         with st.spinner("Processing files..."):
             all_extracted_text = ""
-            results_data = []
             
-            # First pass - process the first email file to extract the project name
+            # Process all uploaded files once
             for uploaded_file in uploaded_files:
-                if uploaded_file.name.lower().endswith((".eml", ".msg")):
-                    # Create a temporary file to store the uploaded content
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as temp_file:
-                        temp_file.write(uploaded_file.getvalue())
-                        temp_file_path = temp_file.name
+                # Create a temporary file to store the uploaded content
+                with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as temp_file:
+                    temp_file.write(uploaded_file.getvalue())
+                    temp_file_path = temp_file.name
+                
+                try:
+                    if uploaded_file.name.lower().endswith(".eml"):
+                        # Process email file
+                        with st.spinner(f"Processing email file: {uploaded_file.name}..."):
+                            header, body, attachments_data, inline_images = process_eml_file(temp_file_path)
+                            email_text = header + "\n" + body
+                            
+                            # Store email data for first email file only (for project matching)
+                            if st.session_state.email_data is None:
+                                st.session_state.email_data = {'email_text': email_text, 'attachments_data': attachments_data}
+                            
+                            # Extract text from email and attachments (including inline images)
+                            extracted_text = extract_text_from_email(email_text, attachments_data, inline_images)
+                            all_extracted_text += f"\n\nEMAIL FILE: {uploaded_file.name}\n{extracted_text}\n{'='*50}\n"
                     
-                    try:
-                        if uploaded_file.name.lower().endswith(".eml"):
-                            # Process email file
-                            header, body, attachments_data = process_eml_file(temp_file_path)
-                        elif uploaded_file.name.lower().endswith(".msg"):
-                            # Process Outlook .msg file
-                            header, body, attachments_data = process_msg_file(temp_file_path)
+                    elif uploaded_file.name.lower().endswith(".msg"):
+                        # Process Outlook .msg file
+                        with st.spinner(f"Processing Outlook email file: {uploaded_file.name}..."):
+                            header, body, attachments_data, inline_images = process_msg_file(temp_file_path)
+                            email_text = header + "\n" + body
+                            
+                            # Store email data for first email file only (for project matching)
+                            if st.session_state.email_data is None:
+                                st.session_state.email_data = {'email_text': email_text, 'attachments_data': attachments_data}
+                            
+                            # Extract text from email and attachments (including inline images)
+                            extracted_text = extract_text_from_email(email_text, attachments_data, inline_images)
+                            all_extracted_text += f"\n\nOUTLOOK EMAIL FILE: {uploaded_file.name}\n{extracted_text}\n{'='*50}\n"
                         
-                        email_text = header + "\n" + body
-                        st.session_state.email_data = {
-                            'email_text': email_text,
-                            'attachments_data': attachments_data
-                        }
-                        
-                        # Break after processing the first email file
-                        break
-                    finally:
-                        # Clean up the temporary file
-                        if os.path.exists(temp_file_path):
-                            os.remove(temp_file_path)
+                    elif uploaded_file.name.lower().endswith(".pdf"):
+                        # Process PDF file directly with Gemini
+                        with st.spinner(f"Processing PDF file: {uploaded_file.name}..."):
+                            pdf_text = process_pdf_with_gemini(uploaded_file.getvalue(), uploaded_file.name)
+                            all_extracted_text += f"\n\nPDF FILE: {uploaded_file.name}\n{pdf_text}\n{'='*50}\n"
+                
+                finally:
+                    # Clean up the temporary file
+                    if os.path.exists(temp_file_path):
+                        os.remove(temp_file_path)
             
-            # Store the uploaded files in session state for later processing
-            st.session_state.uploaded_files = uploaded_files
+            # Store the extracted text in session state for reuse
+            st.session_state.all_extracted_text = all_extracted_text
             st.session_state.query = query
             st.session_state.processed_files = True
             # Rerun to show the next step
@@ -651,48 +908,9 @@ def main():
                 
             return  # Exit early as we've loaded the data from Monday.com
         else:
-            # Process files for new enquiry
-            all_extracted_text = ""
-            
-            # Process all uploaded files
-            if hasattr(st.session_state, 'uploaded_files'):
-                for uploaded_file in st.session_state.uploaded_files:
-                    # Create a temporary file to store the uploaded content
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as temp_file:
-                        temp_file.write(uploaded_file.getvalue())
-                        temp_file_path = temp_file.name
-                    
-                    try:
-                        if uploaded_file.name.lower().endswith(".eml"):
-                            # Process email file
-                            with st.spinner(f"Processing email file: {uploaded_file.name}..."):
-                                header, body, attachments_data = process_eml_file(temp_file_path)
-                                email_text = header + "\n" + body
-                                
-                                # Extract text from email and attachments
-                                extracted_text = extract_text_from_email(email_text, attachments_data)
-                                all_extracted_text += f"\n\nEMAIL FILE: {uploaded_file.name}\n{extracted_text}\n{'='*50}\n"
-                        
-                        elif uploaded_file.name.lower().endswith(".msg"):
-                            # Process Outlook .msg file
-                            with st.spinner(f"Processing Outlook email file: {uploaded_file.name}..."):
-                                header, body, attachments_data = process_msg_file(temp_file_path)
-                                email_text = header + "\n" + body
-                                
-                                # Extract text from email and attachments
-                                extracted_text = extract_text_from_email(email_text, attachments_data)
-                                all_extracted_text += f"\n\nOUTLOOK EMAIL FILE: {uploaded_file.name}\n{extracted_text}\n{'='*50}\n"
-                            
-                        elif uploaded_file.name.lower().endswith(".pdf"):
-                            # Process PDF file directly with Gemini
-                            with st.spinner(f"Processing PDF file: {uploaded_file.name}..."):
-                                pdf_text = process_pdf_with_gemini(uploaded_file.getvalue(), uploaded_file.name)
-                                all_extracted_text += f"\n\nPDF FILE: {uploaded_file.name}\n{pdf_text}\n{'='*50}\n"
-                    
-                    finally:
-                        # Clean up the temporary file
-                        if os.path.exists(temp_file_path):
-                            os.remove(temp_file_path)
+            # Process files for new enquiry - use already extracted text
+            if hasattr(st.session_state, 'all_extracted_text') and st.session_state.all_extracted_text:
+                all_extracted_text = st.session_state.all_extracted_text
                 
                 # Update the query to include the determined enquiry type
                 if hasattr(st.session_state, 'enquiry_type') and st.session_state.enquiry_type:
@@ -715,15 +933,34 @@ def main():
                         "Fall of Tapered", "Tapered Insulation", "Decking"
                     ]
                     
-                    # Simple parsing logic - this could be improved
+                    # Parse the LLM response into a structured format for the dataframe
                     result_dict = {}
                     for param in parameters:
                         # Look for the parameter in the response
                         pattern = rf"{param}:?\s*(.*?)(?:\n|$)"
-                        import re
                         match = re.search(pattern, llm_response, re.IGNORECASE)
                         if match:
-                            result_dict[param] = match.group(1).strip()
+                            value = match.group(1).strip()
+                            
+                            # Remove leading asterisks from all values
+                            value = re.sub(r'^\*+\s*', '', value)
+                            
+                            # Apply special processing for Tapered Insulation parameter
+                            if param == "Tapered Insulation":
+                                value = map_tapered_insulation_value(value)
+                                print(f"DEBUG: Extracted Tapered Insulation value: {value}")
+                            # For Post Code, extract just the postcode area (initial letters)
+                            elif param == "Post Code" and value and value != "Not found" and value != "Not provided":
+                                # Define UK postcode pattern
+                                uk_postcode_pattern = r'([A-Z]{1,2})[0-9]'
+                                postcode_match = re.search(uk_postcode_pattern, value.upper())
+                                if postcode_match:
+                                    value = postcode_match.group(1)
+                                    print(f"DEBUG: Extracted postcode area '{value}' from '{value}'")
+                                else:
+                                    print(f"DEBUG: Could not find valid UK postcode format in '{value}'")
+                            
+                            result_dict[param] = value
                         else:
                             result_dict[param] = "Not found"
                     
@@ -759,15 +996,8 @@ def main():
                         mime="application/vnd.ms-excel"
                     )
                     
-                    # Replace the existing Process New Files button with this
+                    # Process New Files button
                     st.button("Process New Files", on_click=reset_app_state, key="process_new_files_button")
-                else:
-                    st.error("No text could be extracted from the uploaded files.")
-            else:
-                st.error("No files found in session state.")
-    
-    elif process_button and not uploaded_files:
-        st.error("Please upload at least one file first.")
 
 if __name__ == "__main__":
     main()
