@@ -370,7 +370,7 @@ def main():
         
         # After all content but before the chat input - MOVED INSIDE center_content
         st.markdown("<hr style='margin: 15px 0;'>", unsafe_allow_html=True)
-        reset_col1, reset_col2, reset_col3 = st.columns([4, 1, 4])
+        reset_col1, reset_col2, reset_col3 = st.columns([2, 2, 2])
         with reset_col2:
             reset_button = st.button("🔄 Reset App", help="Reset app", on_click=reset_app_state, use_container_width=True)
 
