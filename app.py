@@ -37,7 +37,7 @@ MONDAY_API_TOKEN     = os.getenv("MONDAY_API_TOKEN")
 monday_interface     = MondayDotComInterface(MONDAY_API_TOKEN) if MONDAY_API_TOKEN else None
 
 # ---------------------------------------------------------------------------
-# CHAT PANEL (right column)
+# CHAT PANEL 
 # ---------------------------------------------------------------------------
 
 def show_chat() -> None:
@@ -72,9 +72,11 @@ def show_chat() -> None:
 
         # build system context
         params_text = "\n".join(f"• **{k}**: {v}" for k, v in st.session_state["extracted_params_dict"].items())
+        raw_text = st.session_state.get("all_extracted_text", "")
         system = (
             "You are a roofing‑design assistant. Use the parameters below when answering; "
-            "ask clarifying questions only when necessary.\n\n" + params_text
+            "ask clarifying questions only when necessary.\n\n" + params_text + 
+            "\n\nRaw extracted text from documents:\n" + raw_text
         )
         with st.spinner("Thinking …"):
             resp = gemini_api_with_retry("gemini-2.5-flash-preview-04-17", [system, prompt])
