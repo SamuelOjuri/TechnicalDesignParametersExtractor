@@ -41,9 +41,7 @@ monday_interface     = MondayDotComInterface(MONDAY_API_TOKEN) if MONDAY_API_TOK
 # ---------------------------------------------------------------------------
 
 def show_chat() -> None:
-    """Assistant copilot pinned to the right column."""
-    st.subheader("💬 Ask about the parameters")
-
+    """Assistant copilot for the parameters."""
     st.session_state.setdefault("chat_history", [])
     st.session_state.setdefault("extracted_params_dict", None)
 
@@ -150,23 +148,29 @@ def present_results(df: pd.DataFrame, extra_llm_response: str | None = None) -> 
 def main():
     st.set_page_config(page_title="Design Parameters Extractor", page_icon="📧", layout="wide")
 
-    # ===== header =====
-    head, refresh = st.columns([12, 1])
-    head.markdown("## 📧 Design Parameters Extractor")
-    refresh.button("🔄", help="Reset app", on_click=reset_app_state, use_container_width=True)
-
-    # ===== body columns =====
-    upload_col, chat_col = st.columns([1, 2], gap="large")
-
-    # ------------------------------------------------------------------
-    # LEFT – upload & extraction flow
-    # ------------------------------------------------------------------
-    with upload_col:
-        st.markdown("#### 1️⃣  Upload & Process")
-        uploaded_files = st.file_uploader("Drag + drop email/PDF files", type=["eml", "msg", "pdf"], accept_multiple_files=True)
-        process_clicked = st.button("▶️  Process Files", use_container_width=True)
-
-        # init session keys (once)
+    # Create a three-column layout with wider empty columns on the sides
+    left_spacer, center_content, right_spacer = st.columns([1, 3, 1])
+    
+    # Put all content in the center column
+    with center_content:
+        # ===== header with centered logo/title =====
+        st.markdown("<div style='text-align: center; margin-bottom: 30px;'><h1>📧 Design Parameters Extractor</h1></div>", unsafe_allow_html=True)
+        
+        # Upload section with a card-like appearance
+        st.markdown("""
+        <div style='background-color: #f8f9fa; padding: 20px; border-radius: 10px; margin-bottom: 20px;'>
+            <h3>1️⃣ Upload & Process</h3>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        uploaded_files = st.file_uploader("Drag + drop email/PDF files", type=["eml", "msg", "pdf"], accept_multiple_files=True)
+        
+        # Create a row with columns for centered button placement with more space
+        button_col1, button_col2, button_col3 = st.columns([2, 2, 2])
+        with button_col2:
+            process_clicked = st.button("▶️ Process Files", use_container_width=True)
+        
+        # Init session keys
         for k, default in {
             "processed_files": False,
             "processing_complete": False,
@@ -175,7 +179,7 @@ def main():
             "search_results": None,
         }.items():
             st.session_state.setdefault(k, default)
-
+        
         if process_clicked and uploaded_files and not st.session_state.processed_files:
             with st.spinner("Extracting …"):
                 all_text = process_uploaded_files(uploaded_files)
@@ -264,9 +268,20 @@ def main():
                 st.session_state.processing_complete = True
                 st.rerun()
         # ------------------------------------------------------------------
-        # RESULTS (after processing_complete)
+        # RESULTS section - always show the header, conditionally show content
         # ------------------------------------------------------------------
-        if st.session_state.processing_complete:
+        # Add visual divider before results section
+        st.markdown("<hr style='margin: 30px 0;'>", unsafe_allow_html=True)
+        st.markdown("""
+        <div style='background-color: #f8f9fa; padding: 20px; border-radius: 10px; margin-bottom: 20px;'>
+            <h3>2️⃣ Analysis Results</h3>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Show results only if processing is complete, otherwise show info message
+        if not st.session_state.processing_complete:
+            st.info("Upload and process files to see analysis results here.")
+        else:
             results_data = []
             if st.session_state.enquiry_type == "Amendment" and st.session_state.get("project_details"):
                 with st.spinner("Extracting parameters from Monday.com project …"):
@@ -338,14 +353,26 @@ def main():
                     df = pd.DataFrame([df_row])
                     present_results(df, resp)
 
-            # reset button
+            # Reset button
             st.button("Process New Files", on_click=reset_app_state, use_container_width=True)
 
-    # ------------------------------------------------------------------
-    # RIGHT – chat assistant
-    # ------------------------------------------------------------------
-    with chat_col:
+        # Move chat section OUTSIDE the if block so it's always visible
+        # Add visual divider before chat section
+        st.markdown("<hr style='margin: 30px 0;'>", unsafe_allow_html=True)
+        st.markdown("""
+        <div style='background-color: #f8f9fa; padding: 20px; border-radius: 10px; margin-bottom: 20px;'>
+            <h3>3️⃣ Ask about the parameters</h3>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Show chat interface
         show_chat()
+        
+        # After all content but before the chat input - MOVED INSIDE center_content
+        st.markdown("<hr style='margin: 15px 0;'>", unsafe_allow_html=True)
+        reset_col1, reset_col2, reset_col3 = st.columns([4, 1, 4])
+        with reset_col2:
+            reset_button = st.button("🔄 Reset App", help="Reset app", on_click=reset_app_state, use_container_width=True)
 
 # ---------------------------------------------------------------------------
 # bootstrap
