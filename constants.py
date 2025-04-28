@@ -1,0 +1,15 @@
+DEFAULT_QUERY = """Extract the following design parameters from the documents for a TaperedPlus technical drawing request: 
+            - Post Code of Project Location: (Mostly found in the title block of the drawing attached to emails. Ignore the postcode of any company office address or sender/recipient address and use the post code of the project location only, otherwise state 'Not provided').
+            - Drawing Reference: (TaperedPlus Reference Number e.g. TP*****_**.** - *. Look for references associated with TaperedPlus specifically. If multiple exist, prioritize the latest one mentioned in the context of the request *to* TaperedPlus).
+            - Drawing Title (The Project Name, usually the project location).
+            - Revision (Suffix of the drawing reference e.g. **.** - A. If multiple exist, use the one associated with the Drawing Reference identified above).
+            - Date Received: (Date the email requesting the service *from TaperedPlus* was sent. In a forwarded email chain, this is the date the email was sent *to TaperedPlus*, not the date of the original email further down the chain).
+            - Company: (Identify the company *directly requesting* technical drawings or services *from TaperedPlus*. In a forwarded email, this is the company of the person *sending the email to TaperedPlus*, NOT the company of the original sender further down the chain. Look for the company directly communicating with TaperedPlus).
+            - Contact: (Identify the contact person *directly requesting* the job or drawings *from TaperedPlus*. In a forwarded email, this is the person *sending the email to TaperedPlus*, NOT the original sender further down the chain. Look for the individual directly communicating with TaperedPlus).
+            - Reason for Change: (Either 'Amendment' or 'New Enquiry' based on whether the request refers to an existing project or is entirely new).
+            - Surveyor: (Name of the surveyor if provided).
+            - Target U-Value: (The primary target U-Value requested for the main insulation area).
+            - Target Min U-Value: (A secondary or minimum target U-Value if specified, often for specific areas like upstands).
+            - Fall of Tapered: (The required fall or slope for the tapered insulation).
+            - Tapered Insulation: (The type or brand of tapered insulation product requested).
+            - Decking: (The type of roof decking material described)."""
